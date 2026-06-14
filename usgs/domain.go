@@ -1,77 +1,64 @@
+// Package usgs exposes the USGS Earthquake catalog as a kit Domain driver.
+//
+// A multi-domain host (ant) enables it with a single blank import:
+//
+//	import _ "github.com/tamnd/usgs-cli/usgs"
+//
+// The same Domain also builds the standalone usgs binary (see cli.NewApp).
 package usgs
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"time"
 
 	"github.com/tamnd/any-cli/kit"
-	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes usgs as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/usgs-cli/usgs"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// usgs:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone usgs binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the usgs driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the usgs driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "usgs",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "usgs",
-			Short:  "A command line for usgs.",
-			Long: `A command line for usgs.
+			Short:  "USGS global earthquake catalog",
+			Long: `usgs queries the USGS FDSNWS earthquake catalog for seismic events worldwide.
 
-usgs reads public usgs data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+No API key required. Data from the USGS Comprehensive Earthquake Catalog (ComCat).`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/usgs-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `usgs page` and
-	// `ant get usgs://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "query",
+		Group:   "read",
+		List:    true,
+		Summary: "Search earthquakes by magnitude, date, and order",
+	}, queryOp)
 
-	// List op: members of a page, the home of `usgs links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// usgs://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "recent",
+		Group:   "read",
+		List:    true,
+		Summary: "Significant earthquakes in the last 30 days (mag >= 6)",
+	}, recentOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the USGS client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +69,76 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type queryInput struct {
+	Start   string  `kit:"flag" help:"start date (YYYY-MM-DD); defaults to last 24h"`
+	End     string  `kit:"flag" help:"end date (YYYY-MM-DD)"`
+	MinMag  string  `kit:"flag" help:"minimum magnitude" default:"3.0"`
+	MaxMag  string  `kit:"flag" help:"maximum magnitude"`
+	Limit   int     `kit:"flag,inherit" help:"max results (1-20000)" default:"20"`
+	OrderBy string  `kit:"flag" help:"sort order: time, time-asc, magnitude, magnitude-asc" default:"time"`
+	Client  *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type recentInput struct {
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func queryOp(ctx context.Context, in queryInput, emit func(Earthquake) error) error {
+	start := in.Start
+	if start == "" {
+		start = time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	eqs, err := in.Client.Query(ctx, QueryParams{
+		Start:   start,
+		End:     in.End,
+		MinMag:  in.MinMag,
+		MaxMag:  in.MaxMag,
+		Limit:   limit,
+		OrderBy: in.OrderBy,
+	})
+	if err != nil {
+		return err
+	}
+	for _, eq := range eqs {
+		if err := emit(eq); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full usgs.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized usgs reference: %q", input)
+func recentOp(ctx context.Context, in recentInput, emit func(Earthquake) error) error {
+	eqs, err := in.Client.Recent(ctx)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for _, eq := range eqs {
+		if err := emit(eq); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("usgs has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+// Classify turns any input into the canonical (type, id).
+func (Domain) Classify(input string) (string, string, error) {
+	return "event", input, nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+// Locate returns the live USGS URL for a (type, id).
+func (Domain) Locate(t, id string) (string, error) {
+	return "https://earthquake.usgs.gov/earthquakes/eventpage/" + id, nil
 }
